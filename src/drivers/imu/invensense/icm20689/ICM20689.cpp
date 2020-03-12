@@ -33,8 +33,6 @@
 
 #include "ICM20689.hpp"
 
-#include <px4_platform/board_dma_alloc.h>
-
 using namespace time_literals;
 
 static constexpr int16_t combine(uint8_t msb, uint8_t lsb)
@@ -59,10 +57,6 @@ ICM20689::~ICM20689()
 {
 	Stop();
 
-	if (_dma_data_buffer != nullptr) {
-		board_dma_free(_dma_data_buffer, FIFO::SIZE);
-	}
-
 	perf_free(_transfer_perf);
 	perf_free(_bad_register_perf);
 	perf_free(_bad_transfer_perf);
@@ -76,14 +70,6 @@ bool ICM20689::Init()
 {
 	if (SPI::init() != PX4_OK) {
 		PX4_ERR("SPI::init failed");
-		return false;
-	}
-
-	// allocate DMA capable buffer
-	_dma_data_buffer = (uint8_t *)board_dma_alloc(FIFO::SIZE);
-
-	if (_dma_data_buffer == nullptr) {
-		PX4_ERR("DMA alloc failed");
 		return false;
 	}
 
@@ -167,8 +153,8 @@ void ICM20689::Run()
 				ScheduleDelayed(10_ms);
 
 			} else {
-				PX4_DEBUG("Reset not complete, check again in 1 ms");
-				ScheduleDelayed(1_ms);
+				PX4_DEBUG("Reset not complete, check again in 10 ms");
+				ScheduleDelayed(10_ms);
 			}
 		}
 
@@ -194,8 +180,8 @@ void ICM20689::Run()
 
 		} else {
 			PX4_DEBUG("Configure failed, retrying");
-			// try again in 1 ms
-			ScheduleDelayed(1_ms);
+			// try again in 10 ms
+			ScheduleDelayed(10_ms);
 		}
 
 		break;
@@ -205,12 +191,16 @@ void ICM20689::Run()
 			uint8_t samples = 0;
 
 			if (_data_ready_interrupt_enabled) {
+				// timestamp set in data ready interrupt
+				timestamp_sample = _fifo_watermark_interrupt_timestamp;
+
+				// check the FIFO count manually for safety
+				const uint16_t fifo_count = FIFOReadCount();
+				//samples = _fifo_read_samples.load();
+				samples = (fifo_count / sizeof(FIFO::DATA) / 2) * 2; // round down to nearest 2
+
 				// re-schedule as watchdog timeout
 				ScheduleDelayed(10_ms);
-
-				// timestamp set in data ready interrupt
-				samples = _fifo_read_samples.load();
-				timestamp_sample = _fifo_watermark_interrupt_timestamp;
 			}
 
 			bool failure = false;
@@ -421,12 +411,12 @@ bool ICM20689::RegisterCheck(const register_config_t &reg_cfg, bool notify)
 
 	const uint8_t reg_value = RegisterRead(reg_cfg.reg);
 
-	if (reg_cfg.set_bits && !(reg_value & reg_cfg.set_bits)) {
+	if (reg_cfg.set_bits && ((reg_value & reg_cfg.set_bits) != reg_cfg.set_bits)) {
 		PX4_DEBUG("0x%02hhX: 0x%02hhX (0x%02hhX not set)", (uint8_t)reg_cfg.reg, reg_value, reg_cfg.set_bits);
 		success = false;
 	}
 
-	if (reg_cfg.clear_bits && (reg_value & reg_cfg.clear_bits)) {
+	if (reg_cfg.clear_bits && ((reg_value & reg_cfg.clear_bits) != 0)) {
 		PX4_DEBUG("0x%02hhX: 0x%02hhX (0x%02hhX not cleared)", (uint8_t)reg_cfg.reg, reg_value, reg_cfg.clear_bits);
 		success = false;
 	}
@@ -507,14 +497,13 @@ uint16_t ICM20689::FIFOReadCount()
 
 bool ICM20689::FIFORead(const hrt_abstime &timestamp_sample, uint16_t samples)
 {
-	TransferBuffer *report = (TransferBuffer *)_dma_data_buffer;
+	FIFOTransferBuffer buffer{};
+
 	const size_t transfer_size = math::min(samples * sizeof(FIFO::DATA) + 1, FIFO::SIZE);
-	memset(report, 0, transfer_size);
-	report->cmd = static_cast<uint8_t>(Register::FIFO_R_W) | DIR_READ;
 
 	perf_begin(_transfer_perf);
 
-	if (transfer(_dma_data_buffer, _dma_data_buffer, transfer_size) != PX4_OK) {
+	if (transfer((uint8_t *)&buffer, (uint8_t *)&buffer, transfer_size) != PX4_OK) {
 		perf_end(_transfer_perf);
 		perf_count(_bad_transfer_perf);
 		return false;
@@ -522,8 +511,8 @@ bool ICM20689::FIFORead(const hrt_abstime &timestamp_sample, uint16_t samples)
 
 	perf_end(_transfer_perf);
 
-	ProcessGyro(timestamp_sample, report, samples);
-	return ProcessAccel(timestamp_sample, report, samples);
+	ProcessGyro(timestamp_sample, buffer, samples);
+	return ProcessAccel(timestamp_sample, buffer, samples);
 }
 
 void ICM20689::FIFOReset()
@@ -556,7 +545,7 @@ static bool fifo_accel_equal(const FIFO::DATA &f0, const FIFO::DATA &f1)
 	return (memcmp(&f0.ACCEL_XOUT_H, &f1.ACCEL_XOUT_H, 6) == 0);
 }
 
-bool ICM20689::ProcessAccel(const hrt_abstime &timestamp_sample, const TransferBuffer *const report, uint8_t samples)
+bool ICM20689::ProcessAccel(const hrt_abstime &timestamp_sample, const FIFOTransferBuffer &buffer, uint8_t samples)
 {
 	PX4Accelerometer::FIFOSample accel;
 	accel.timestamp_sample = timestamp_sample;
@@ -568,12 +557,12 @@ bool ICM20689::ProcessAccel(const hrt_abstime &timestamp_sample, const TransferB
 	int accel_first_sample = 1;
 
 	if (samples >= 3) {
-		if (fifo_accel_equal(report->f[0], report->f[1])) {
+		if (fifo_accel_equal(buffer.f[0], buffer.f[1])) {
 			// [A0, A1, A2, A3]
 			//  A0==A1, A2==A3
 			accel_first_sample = 1;
 
-		} else if (fifo_accel_equal(report->f[1], report->f[2])) {
+		} else if (fifo_accel_equal(buffer.f[1], buffer.f[2])) {
 			// [A0, A1, A2, A3]
 			//  A0, A1==A2, A3
 			accel_first_sample = 0;
@@ -587,7 +576,7 @@ bool ICM20689::ProcessAccel(const hrt_abstime &timestamp_sample, const TransferB
 	int accel_samples = 0;
 
 	for (int i = accel_first_sample; i < samples; i = i + 2) {
-		const FIFO::DATA &fifo_sample = report->f[i];
+		const FIFO::DATA &fifo_sample = buffer.f[i];
 		int16_t accel_x = combine(fifo_sample.ACCEL_XOUT_H, fifo_sample.ACCEL_XOUT_L);
 		int16_t accel_y = combine(fifo_sample.ACCEL_YOUT_H, fifo_sample.ACCEL_YOUT_L);
 		int16_t accel_z = combine(fifo_sample.ACCEL_ZOUT_H, fifo_sample.ACCEL_ZOUT_L);
@@ -607,7 +596,7 @@ bool ICM20689::ProcessAccel(const hrt_abstime &timestamp_sample, const TransferB
 	return !bad_data;
 }
 
-void ICM20689::ProcessGyro(const hrt_abstime &timestamp_sample, const TransferBuffer *const report, uint8_t samples)
+void ICM20689::ProcessGyro(const hrt_abstime &timestamp_sample, const FIFOTransferBuffer &buffer, uint8_t samples)
 {
 	PX4Gyroscope::FIFOSample gyro;
 	gyro.timestamp_sample = timestamp_sample;
@@ -615,7 +604,7 @@ void ICM20689::ProcessGyro(const hrt_abstime &timestamp_sample, const TransferBu
 	gyro.dt = _fifo_empty_interval_us / _fifo_gyro_samples;
 
 	for (int i = 0; i < samples; i++) {
-		const FIFO::DATA &fifo_sample = report->f[i];
+		const FIFO::DATA &fifo_sample = buffer.f[i];
 
 		const int16_t gyro_x = combine(fifo_sample.GYRO_XOUT_H, fifo_sample.GYRO_XOUT_L);
 		const int16_t gyro_y = combine(fifo_sample.GYRO_YOUT_H, fifo_sample.GYRO_YOUT_L);
